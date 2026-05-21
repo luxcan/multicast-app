@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Net.NetworkInformation;
@@ -35,14 +35,17 @@ while (true) {
 }
 
 while (true) {
-    Console.Write("Enter the multicast IP address: ");
+    Console.Write("Enter the multicast IP address (224.0.0.0 - 239.255.255.255): ");
     multicastGroup = Console.ReadLine()!;
 
-    if (IPAddress.TryParse(multicastGroup, out _)) {
-        break;
+    if (IPAddress.TryParse(multicastGroup, out IPAddress? addr)) {
+        byte[] bytes = addr.GetAddressBytes();
+        if (bytes[0] >= 224 && bytes[0] <= 239) {
+            break;
+        }
     }
 
-    Console.WriteLine("Invalid IP address.");
+    Console.WriteLine("Invalid multicast address. Must be in range 224.0.0.0 - 239.255.255.255.");
 }
 
 while (true) {
@@ -63,7 +66,6 @@ while (true) {
     Console.WriteLine("Invalid choice. Please enter 1 for Sender or 2 for Receiver.");
 }
 
-// Listen for "Esc" key press
 Thread keyListener = new Thread(() => {
     while (!quit) {
         if (Console.KeyAvailable && Console.ReadKey(true).Key == ConsoleKey.Escape) {
@@ -71,6 +73,7 @@ Thread keyListener = new Thread(() => {
         }
     }
 });
+keyListener.IsBackground = true;
 keyListener.Start();
 
 if (mode == 1) {
@@ -80,46 +83,56 @@ if (mode == 1) {
 }
 
 static void StartSender(IPAddress localIP, string multicastGroup, int multicastPort, ref bool quit) {
-    using (var udpClient = new UdpClient(new IPEndPoint(localIP, 0))) {
-        IPEndPoint remoteEndPoint = new IPEndPoint(IPAddress.Parse(multicastGroup), multicastPort);
-        Console.Write("Enter the message to send: ");
-        string message = Console.ReadLine()!;
+    using var udpClient = new UdpClient(new IPEndPoint(localIP, 0));
 
-        byte[] data = Encoding.UTF8.GetBytes(message);
+    // Force multicast traffic out through the selected interface
+    udpClient.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface,
+        localIP.GetAddressBytes());
 
-        Console.WriteLine($"Sending multicast packets to {multicastGroup}:{multicastPort}... Press 'Esc' to quit.");
+    IPEndPoint remoteEndPoint = new IPEndPoint(IPAddress.Parse(multicastGroup), multicastPort);
 
-        while (!quit) {
-            udpClient.Send(data, data.Length, remoteEndPoint);
-            Console.WriteLine($"{DateTime.Now} = Sent");
-            Thread.Sleep(1000);
-        }
+    Console.Write("Enter the message to send: ");
+    string message = Console.ReadLine()!;
+    byte[] data = Encoding.UTF8.GetBytes(message);
+
+    Console.WriteLine($"Sending multicast packets to {multicastGroup}:{multicastPort} via {localIP}... Press 'Esc' to quit.");
+
+    while (!quit) {
+        udpClient.Send(data, data.Length, remoteEndPoint);
+        Console.WriteLine($"{DateTime.Now} = Sent");
+        Thread.Sleep(1000);
     }
 }
 
 static void StartReceiver(IPAddress localIP, string multicastGroup, int multicastPort, ref bool quit) {
-    using (UdpClient udpClient = new UdpClient(new IPEndPoint(localIP, multicastPort))) {
-        udpClient.ExclusiveAddressUse = false;
+    // Create socket first so ReuseAddress can be set before Bind
+    using var udpClient = new UdpClient();
+    udpClient.ExclusiveAddressUse = false;
+    udpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
 
-        udpClient.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+    // Bind to ANY — multicast packets are addressed to the group IP, not localIP
+    udpClient.Client.Bind(new IPEndPoint(IPAddress.Any, multicastPort));
 
-        udpClient.JoinMulticastGroup(IPAddress.Parse(multicastGroup));
+    // Join the group on the specific interface the user selected
+    udpClient.JoinMulticastGroup(IPAddress.Parse(multicastGroup), localIP);
 
-        Console.WriteLine($"Listening for multicast packets on {multicastGroup}:{multicastPort}... Press 'Esc' to quit.");
+    // Receive timeout lets the loop check the quit flag without busy-waiting
+    udpClient.Client.ReceiveTimeout = 500;
 
-        while (!quit) {
-            if (udpClient.Available > 0) {
-                IPEndPoint remoteEndPoint = new IPEndPoint(IPAddress.Any, multicastPort);
-                byte[] data = udpClient.Receive(ref remoteEndPoint);
-                try {
-                    string message = Encoding.UTF8.GetString(data);
-                    Console.WriteLine($"{DateTime.Now} = Received from \"{remoteEndPoint.Address}:{remoteEndPoint.Port}\": {message}");
-                } catch (DecoderFallbackException) {
-                    Console.WriteLine($"{DateTime.Now} = Received (Not in UTF8) from \"{remoteEndPoint.Address}:{remoteEndPoint.Port}\": Bytes Length ({data.Length})");
-                } catch (Exception) {
-                    Console.WriteLine($"{DateTime.Now} = Received from \"{remoteEndPoint.Address}:{remoteEndPoint.Port}\": Encounter exception while trying to convert data into UTF8");
-                }
+    Console.WriteLine($"Listening for multicast packets on {multicastGroup}:{multicastPort} via {localIP}... Press 'Esc' to quit.");
+
+    while (!quit) {
+        try {
+            IPEndPoint remoteEndPoint = new IPEndPoint(IPAddress.Any, 0);
+            byte[] data = udpClient.Receive(ref remoteEndPoint);
+            try {
+                string message = Encoding.UTF8.GetString(data);
+                Console.WriteLine($"{DateTime.Now} = Received from \"{remoteEndPoint.Address}:{remoteEndPoint.Port}\": {message}");
+            } catch (DecoderFallbackException) {
+                Console.WriteLine($"{DateTime.Now} = Received (Not UTF-8) from \"{remoteEndPoint.Address}:{remoteEndPoint.Port}\": {data.Length} bytes");
             }
+        } catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut) {
+            // Normal timeout — loop back to check quit flag
         }
     }
 }
